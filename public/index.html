@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#0d0b1a" />
+  <title>DJ Sync — ouça junto, em sincronia</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+
+  <!-- Tela inicial ------------------------------------------------------->
+  <main id="landing" class="screen landing">
+    <div class="landing-card">
+      <div class="logo-mark">▶</div>
+      <h1>DJ <span>Sync</span></h1>
+      <p class="tagline">Um player, todo mundo no mesmo beat. Cole um link do YouTube e deixe seus amigos ouvir junto, na mesma hora.</p>
+
+      <label class="field-label" for="landing-name">Seu nome</label>
+      <input id="landing-name" class="input" maxlength="24" placeholder="Ex.: Nata" autocomplete="nickname" />
+
+      <div class="landing-divider"><span>comece uma sala ou entre em uma</span></div>
+
+      <div class="landing-actions">
+        <button id="create-btn" class="btn btn-primary btn-lg">Criar sala nova</button>
+      </div>
+
+      <div class="join-row">
+        <input id="join-code" class="input" maxlength="8" placeholder="Código (ex.: A7K2P)" autocomplete="off" />
+        <button id="join-btn" class="btn btn-secondary">Entrar</button>
+      </div>
+
+      <p class="fine-print">Dica: ao criar uma sala, você vira o DJ. Quem entrar pelo link pode pedir músicas pelo nome no chat, com <code>!sr nome da música</code>.</p>
+    </div>
+  </main>
+
+  <!-- Sala --------------------------------------------------------------->
+  <main id="app" class="screen app hidden">
+    <header class="topbar">
+      <div class="topbar-left">
+        <div class="logo-mark small">▶</div>
+        <div class="brand">DJ <span>Sync</span></div>
+        <button id="room-badge" class="room-badge" title="Copiar link da sala">SALA <strong id="room-code">-----</strong></button>
+      </div>
+      <div class="topbar-right">
+        <span id="listener-count" class="pill" title="Pessoas ouvindo">👤 0</span>
+        <span id="host-pill" class="pill host hidden">🎧 Você é o DJ</span>
+        <button id="copy-btn" class="btn btn-ghost">Copiar link</button>
+        <button id="audio-btn" class="btn btn-warn hidden">🔊 Ativar áudio</button>
+        <button id="leave-btn" class="btn btn-ghost">Sair</button>
+      </div>
+    </header>
+
+    <div class="layout">
+      <section class="stage">
+        <div class="player-shell">
+          <div id="player"></div>
+          <div id="player-gate" class="player-gate">
+            <div class="gate-icon">🔊</div>
+            <h2>Clique para ativar o áudio</h2>
+            <p>O navegador só permite tocar som depois de um clique.</p>
+            <button id="gate-btn" class="btn btn-primary btn-lg">Ativar e ouvir</button>
+          </div>
+        </div>
+
+        <div class="now-playing">
+          <div class="np-art"><img id="np-thumb" alt="" src="" /></div>
+          <div class="np-info">
+            <div class="np-label">TOCANDO AGORA</div>
+            <div id="np-title" class="np-title">Nada tocando ainda</div>
+            <div id="np-meta" class="np-meta">Adicione uma música à fila para começar</div>
+          </div>
+          <div id="sync-pill" class="sync-pill">—</div>
+        </div>
+
+        <div id="dj-controls" class="controls hidden">
+          <button id="prev-btn" class="btn btn-control" title="Música anterior">⏮</button>
+          <button id="play-btn" class="btn btn-control btn-play" title="Tocar / pausar">▶</button>
+          <button id="pause-btn" class="btn btn-control" title="Pausar">⏸</button>
+          <button id="next-btn" class="btn btn-control" title="Próxima música">⏭</button>
+          <div class="seek-wrap">
+            <input id="seek" class="seek" type="range" min="0" max="100" value="0" step="1" />
+            <span id="time-label" class="time-label">0:00</span>
+          </div>
+        </div>
+
+        <div id="listener-note" class="listener-note hidden">
+          🎧 O DJ controla o player. Peça suas músicas pelo nome na fila ao lado ou mande <code>!sr nome da música</code> no chat.
+        </div>
+
+        <div class="stage-footer">
+          <div class="volume-box">
+            <span>🔈</span>
+            <input id="volume" type="range" min="0" max="100" value="80" title="Seu volume (não afeta os outros)" />
+            <span id="volume-value">80%</span>
+          </div>
+          <div class="host-settings hidden" id="host-settings">
+            <label class="switch">
+              <input id="allow-requests" type="checkbox" checked />
+              <span>Permitir pedidos da fila</span>
+            </label>
+            <button id="clear-btn" class="btn btn-ghost btn-sm">Limpar fila</button>
+          </div>
+          <button id="resync-btn" class="btn btn-ghost btn-sm">⟳ Resincronizar</button>
+        </div>
+      </section>
+
+      <aside class="sidebar">
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Fila de músicas <span id="queue-count" class="count">0</span></h2>
+          </div>
+          <form id="add-form" class="add-form">
+            <input id="add-url" class="input" placeholder="Nome da música ou link do YouTube..." autocomplete="off" />
+            <button class="btn btn-primary" type="submit">Adicionar</button>
+          </form>
+          <div id="queue" class="queue"></div>
+        </section>
+
+        <section class="panel chat-panel">
+          <div class="panel-head">
+            <h2>Chat da sala</h2>
+            <span class="hint-inline">use <code>!sr nome da música</code></span>
+          </div>
+          <div id="messages" class="messages"></div>
+          <form id="chat-form" class="chat-form">
+            <input id="chat-input" class="input" maxlength="200" placeholder="Escreva uma mensagem..." autocomplete="off" />
+            <button class="btn btn-secondary" type="submit">Enviar</button>
+          </form>
+        </section>
+      </aside>
+    </div>
+  </main>
+
+  <script src="/config.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
