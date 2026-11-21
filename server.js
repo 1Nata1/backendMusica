@@ -79,6 +79,22 @@ function getRoom(code) {
   return rooms.get(String(code || '').toUpperCase()) || null;
 }
 
+// Mantém só uma entrada por vídeo na lista de cada pessoa (a mais recente).
+// Também limpa duplicatas antigas que ficaram salvas antes dessa correção.
+function uniqueRequests(tracks) {
+  const byVideo = new Map();
+  for (const track of Array.isArray(tracks) ? tracks : []) {
+    if (!track || !track.videoId) continue;
+    const previous = byVideo.get(track.videoId);
+    if (!previous || Number(track.addedAt || 0) >= Number(previous.addedAt || 0)) {
+      byVideo.set(track.videoId, track);
+    }
+  }
+  return Array.from(byVideo.values())
+    .sort((a, b) => Number(a.addedAt || 0) - Number(b.addedAt || 0))
+    .slice(-60);
+}
+
 function currentPosition(room) {
   if (!room.current) return 0;
   const elapsed = room.playing ? (Date.now() - room.updatedAt) / 1000 : 0;
@@ -94,7 +110,9 @@ function stateFor(room, ws) {
     position: currentPosition(room),
     serverTime: Date.now(),
     queue: room.queue,
-    userRequests: room.userRequests || {},
+    userRequests: Object.fromEntries(
+      Object.entries(room.userRequests || {}).map(([user, tracks]) => [user, uniqueRequests(tracks)])
+    ),
     messages: room.messages.slice(-60),
     listeners: room.clients.size,
     hostId: room.hostId,
@@ -362,8 +380,9 @@ async function addTrack(room, input, requestedBy, ws) {
   });
 
   // Guarda o pedido no gosto musical da pessoa, mesmo depois que a música toca.
+  // Se ela pedir a mesma música de novo, atualiza a entrada em vez de duplicar.
   if (!room.userRequests) room.userRequests = {};
-  const favorites = room.userRequests[key] || [];
+  const favorites = uniqueRequests(room.userRequests[key]);
   favorites.push({
     videoId: track.videoId,
     title: track.title,
@@ -371,8 +390,7 @@ async function addTrack(room, input, requestedBy, ws) {
     requestedBy: cleanName,
     addedAt: Date.now(),
   });
-  if (favorites.length > 60) favorites.splice(0, favorites.length - 60);
-  room.userRequests[key] = favorites;
+  room.userRequests[key] = favorites.slice(-60);
   const userKeys = Object.keys(room.userRequests);
   if (userKeys.length > 200) delete room.userRequests[userKeys[0]];
 
@@ -521,13 +539,9 @@ function handleAction(ws, room, msg) {
       for (const [user, tracks] of Object.entries(incoming)) {
         if (!Array.isArray(tracks)) continue;
         const key = String(user).toLowerCase().slice(0, 24);
-        const current = room.userRequests[key] || [];
-        const known = new Set(current.map((t) => `${t.addedAt}:${t.videoId}`));
-        const fresh = tracks
-          .filter((t) => t && t.videoId && !known.has(`${t.addedAt}:${t.videoId}`))
-          .slice(-60);
-        if (fresh.length) {
-          room.userRequests[key] = current.concat(fresh).slice(-60);
+        const merged = uniqueRequests([...(room.userRequests[key] || []), ...tracks]);
+        if (JSON.stringify(merged) !== JSON.stringify(room.userRequests[key] || [])) {
+          room.userRequests[key] = merged;
           changed = true;
         }
       }
