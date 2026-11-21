@@ -65,6 +65,8 @@ function createRoom(code = makeCode()) {
     updatedAt: Date.now(),
     queue: [],
     history: [],
+    //Histórico de pedidos por usuário (chave = nome em minúsculas)
+    userRequests: {},
     messages: [],
     clients: new Set(),
     hostId: null,
@@ -92,6 +94,7 @@ function stateFor(room, ws) {
     position: currentPosition(room),
     serverTime: Date.now(),
     queue: room.queue,
+    userRequests: room.userRequests || {},
     messages: room.messages.slice(-60),
     listeners: room.clients.size,
     hostId: room.hostId,
@@ -346,14 +349,33 @@ async function addTrack(room, input, requestedBy, ws) {
     return;
   }
 
+  const cleanName = String(requestedBy || 'Convidado').trim().slice(0, 24) || 'Convidado';
+  const key = cleanName.toLowerCase();
+
   room.queue.push({
     trackId: crypto.randomUUID(),
     videoId: track.videoId,
     title: track.title,
     author: track.author,
-    requestedBy: requestedBy.slice(0, 24),
+    requestedBy: cleanName,
     addedAt: Date.now(),
   });
+
+  // Guarda o pedido no gosto musical da pessoa, mesmo depois que a música toca.
+  if (!room.userRequests) room.userRequests = {};
+  const favorites = room.userRequests[key] || [];
+  favorites.push({
+    videoId: track.videoId,
+    title: track.title,
+    author: track.author,
+    requestedBy: cleanName,
+    addedAt: Date.now(),
+  });
+  if (favorites.length > 60) favorites.splice(0, favorites.length - 60);
+  room.userRequests[key] = favorites;
+  const userKeys = Object.keys(room.userRequests);
+  if (userKeys.length > 200) delete room.userRequests[userKeys[0]];
+
   systemMessage(room, `${requestedBy} adicionou: ${track.title}`);
   return track;
 }
@@ -488,6 +510,35 @@ function handleAction(ws, room, msg) {
       room.settings.allowRequests = Boolean(msg.value);
       broadcastState(room);
       break;
+
+    // O DJ devolve o histórico guardado no navegador após um restart do servidor.
+    case 'restoreRequests': {
+      if (!requireHost(room, ws)) return;
+      const incoming = msg.requests && typeof msg.requests === 'object' ? msg.requests : {};
+      if (!room.userRequests) room.userRequests = {};
+      let changed = false;
+
+      for (const [user, tracks] of Object.entries(incoming)) {
+        if (!Array.isArray(tracks)) continue;
+        const key = String(user).toLowerCase().slice(0, 24);
+        const current = room.userRequests[key] || [];
+        const known = new Set(current.map((t) => `${t.addedAt}:${t.videoId}`));
+        const fresh = tracks
+          .filter((t) => t && t.videoId && !known.has(`${t.addedAt}:${t.videoId}`))
+          .slice(-60);
+        if (fresh.length) {
+          room.userRequests[key] = current.concat(fresh).slice(-60);
+          changed = true;
+        }
+      }
+      const keys = Object.keys(room.userRequests);
+      if (keys.length > 200) {
+        for (const key of keys.slice(0, keys.length - 200)) delete room.userRequests[key];
+        changed = true;
+      }
+      if (changed) broadcastState(room);
+      break;
+    }
 
     default:
       break;
@@ -625,7 +676,43 @@ function handleTwitchLine(line) {
   if (channel !== TWITCH.channel) return;
 
   const [command, ...rest] = message.trim().split(/\s+/);
-  if (!TWITCH.commands.includes((command || '').toLowerCase())) return;
+  const cmd = (command || '').toLowerCase();
+
+  // Consulta ao gosto musical da pessoa: $lista @usuario (ou só $lista para o ranking)
+  if (cmd === '$lista' || cmd === '!lista' || cmd === '$list' || cmd === '!list') {
+    const room = getRoom(TWITCH.room);
+    if (!room) {
+      replyTwitch('A sala do DJ ainda não está aberta.');
+      return;
+    }
+    const favorites = room.userRequests || {};
+    const target = rest.join(' ').trim().replace(/^@/, '').toLowerCase();
+
+    if (target) {
+      const tracks = favorites[target];
+      if (!tracks?.length) {
+        replyTwitch(`@${target} ainda não pediu músicas.`);
+        return;
+      }
+      const latest = tracks.slice(-5).map((t) => t.title).join(' | ');
+      replyTwitch(`${target}: ${tracks.length} pedidos. Últimos: ${latest}`);
+      return;
+    }
+
+    const top = Object.entries(favorites)
+      .map(([user, tracks]) => ({ user, n: tracks.length }))
+      .sort((a, b) => b.n - a.n)
+      .slice(0, 6)
+      .map((item) => `${item.user} (${item.n})`);
+    replyTwitch(
+      top.length
+        ? `Pedidos: ${top.join(' · ')}. Use $lista @usuario para ver as músicas.`
+        : 'Ninguém pediu músicas ainda.'
+    );
+    return;
+  }
+
+  if (!TWITCH.commands.includes(cmd)) return;
 
   const query = rest.join(' ').trim();
   if (!query) {
