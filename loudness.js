@@ -17,7 +17,10 @@ const queue = [];
 let active = 0;
 const MAX_ACTIVE = 2;
 
-let innertube = { key: null, version: null, sts: 0, visitor: null, fetchedAt: 0 };
+let innertube = { key: null, version: null, sts: 0, visitor: null, cookie: null, fetchedAt: 0 };
+
+// Função na Vercel: sai com outro IP, útil quando o Render é bloqueado pelo YouTube.
+const PROXY_URL = process.env.DJ_SYNC_LOUDNESS_PROXY || 'https://teste-de-musica.vercel.app/api/loudness';
 
 function clampGain(value) {
   const n = Number(value);
@@ -59,9 +62,10 @@ async function getInnertube() {
   const version = html.match(/"INNERTUBE_CLIENT_VERSION":"([^"]+)"/)?.[1];
   const sts = Number(html.match(/"STS":(\d+)/)?.[1] || 0);
   const visitor = html.match(/"VISITOR_DATA":"([^"]+)"/)?.[1] || undefined;
+  const cookie = response.headers.get('set-cookie') || undefined;
   if (!key || !version || !sts) throw new Error('configuração do player não encontrada');
 
-  innertube = { key, version, sts, visitor, fetchedAt: Date.now() };
+  innertube = { key, version, sts, visitor, cookie, fetchedAt: Date.now() };
   return innertube;
 }
 
@@ -73,7 +77,7 @@ function loudnessOf(data) {
 }
 
 async function fromPlayerApi(videoId, host) {
-  const { key, version, sts, visitor } = await getInnertube();
+  const { key, version, sts, visitor, cookie } = await getInnertube();
   const response = await fetch(`${host}/youtubei/v1/player?key=${key}&prettyPrint=false`, {
     method: 'POST',
     headers: {
@@ -82,6 +86,8 @@ async function fromPlayerApi(videoId, host) {
       'Accept-Language': 'pt-BR,pt;q=0.9',
       'X-Youtube-Client-Name': '1',
       'X-Youtube-Client-Version': version,
+      ...(visitor ? { 'X-Goog-Visitor-Id': visitor } : {}),
+      ...(cookie ? { Cookie: cookie } : {}),
       Origin: host,
     },
     body: JSON.stringify({
@@ -102,11 +108,26 @@ async function fromPlayerApi(videoId, host) {
     signal: AbortSignal.timeout(15000),
   });
   if (!response.ok) throw new Error(`${host} respondeu ${response.status}`);
+  const data = await response.json().catch(() => ({}));
   try {
-    return loudnessOf(await response.json());
+    return loudnessOf(data);
   } catch (error) {
-    throw new Error(`${host}: ${error.message}`);
+    const status = data.playabilityStatus?.status || 'sem status';
+    const reason = String(data.playabilityStatus?.reason || '').slice(0, 80);
+    throw new Error(`${host}: ${error.message} (${status}${reason ? ' — ' + reason : ''})`);
   }
+}
+
+async function fromVercelProxy(videoId) {
+  const response = await fetch(`${PROXY_URL}?id=${encodeURIComponent(videoId)}`, {
+    headers: { 'User-Agent': USER_AGENT },
+    signal: AbortSignal.timeout(25000),
+  });
+  if (!response.ok) throw new Error(`proxy respondeu ${response.status}`);
+  const data = await response.json();
+  const lufs = Number(data.lufs);
+  if (!Number.isFinite(lufs)) throw new Error(`proxy sem loudness: ${String(data.error || '').slice(0, 80)}`);
+  return lufs;
 }
 
 // Extrai um objeto JSON grande do HTML sem depender de regex "até o primeiro };".
@@ -157,6 +178,13 @@ const PLAYER_HOSTS = [
 ];
 
 async function fetchTrackLufs(videoId) {
+  // Primeiro tenta a Vercel (outro IP); depois os hosts diretos; por fim o /watch.
+  try {
+    return await fromVercelProxy(videoId);
+  } catch (error) {
+    console.error(`Loudness: proxy indisponível para ${videoId} — ${error.message}`);
+  }
+
   let lastError;
   for (const host of PLAYER_HOSTS) {
     try {
