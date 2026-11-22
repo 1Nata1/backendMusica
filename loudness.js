@@ -22,6 +22,13 @@ let innertube = { key: null, version: null, sts: 0, visitor: null, cookie: null,
 // Função na Vercel: sai com outro IP, útil quando o Render é bloqueado pelo YouTube.
 const PROXY_URL = process.env.DJ_SYNC_LOUDNESS_PROXY || 'https://teste-de-musica.vercel.app/api/loudness';
 
+// O cliente WEB costuma levar LOGIN_REQUIRED em IPs de datacenter. ANDROID e iOS
+// respondem sem login e também expõem a loudness.
+const PLAYER_CLIENTS = [
+  { name: 'ANDROID', ua: 'com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip', headerName: '3', client: { clientName: 'ANDROID', clientVersion: '20.10.38', androidSdkVersion: 30, osName: 'Android', osVersion: '11', hl: 'pt', gl: 'BR' } },
+  { name: 'IOS', ua: 'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3 like Mac OS X)', headerName: '5', client: { clientName: 'IOS', clientVersion: '20.10.4', deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.3.2.22D82', hl: 'pt', gl: 'BR' } },
+];
+
 function clampGain(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return 1;
@@ -76,36 +83,33 @@ function loudnessOf(data) {
   return lufs;
 }
 
-async function fromPlayerApi(videoId, host) {
+async function fromPlayerApi(videoId, host, spec) {
   const { key, version, sts, visitor, cookie } = await getInnertube();
+  const isWeb = spec.name === 'WEB';
   const response = await fetch(`${host}/youtubei/v1/player?key=${key}&prettyPrint=false`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'User-Agent': USER_AGENT,
+      'User-Agent': isWeb ? USER_AGENT : spec.ua,
       'Accept-Language': 'pt-BR,pt;q=0.9',
-      'X-Youtube-Client-Name': '1',
-      'X-Youtube-Client-Version': version,
-      ...(visitor ? { 'X-Goog-Visitor-Id': visitor } : {}),
-      ...(cookie ? { Cookie: cookie } : {}),
+      'X-Youtube-Client-Name': isWeb ? '1' : spec.headerName,
+      'X-Youtube-Client-Version': isWeb ? version : spec.client.clientVersion,
+      ...(isWeb && visitor ? { 'X-Goog-Visitor-Id': visitor } : {}),
+      ...(isWeb && cookie ? { Cookie: cookie } : {}),
       Origin: host,
     },
     body: JSON.stringify({
       context: {
-        client: {
-          clientName: 'WEB',
-          clientVersion: version,
-          hl: 'pt',
-          gl: 'BR',
-          ...(visitor ? { visitorData: visitor } : {}),
-        },
+        client: isWeb
+          ? { clientName: 'WEB', clientVersion: version, hl: 'pt', gl: 'BR', ...(visitor ? { visitorData: visitor } : {}) }
+          : spec.client,
       },
       videoId,
       contentCheckOk: true,
       racyCheckOk: true,
       playbackContext: { contentPlaybackContext: { signatureTimestamp: sts } },
     }),
-    signal: AbortSignal.timeout(15000),
+    signal: AbortSignal.timeout(12000),
   });
   if (!response.ok) throw new Error(`${host} respondeu ${response.status}`);
   const data = await response.json().catch(() => ({}));
@@ -114,7 +118,7 @@ async function fromPlayerApi(videoId, host) {
   } catch (error) {
     const status = data.playabilityStatus?.status || 'sem status';
     const reason = String(data.playabilityStatus?.reason || '').slice(0, 80);
-    throw new Error(`${host}: ${error.message} (${status}${reason ? ' — ' + reason : ''})`);
+    throw new Error(`${host}/${spec.name}: ${error.message} (${status}${reason ? ' — ' + reason : ''})`);
   }
 }
 
@@ -185,25 +189,34 @@ async function fetchTrackLufs(videoId) {
     console.error(`Loudness: proxy indisponível para ${videoId} — ${error.message}`);
   }
 
+  const attempts = [];
+  for (const spec of PLAYER_CLIENTS) attempts.push({ host: PLAYER_HOSTS[0], spec });
+  attempts.push({ host: PLAYER_HOSTS[0], spec: { name: 'WEB' } });
+  for (const host of PLAYER_HOSTS.slice(1)) {
+    for (const spec of PLAYER_CLIENTS) attempts.push({ host, spec });
+  }
+
   let lastError;
-  for (const host of PLAYER_HOSTS) {
+  for (const { host, spec } of attempts) {
     try {
-      return await fromPlayerApi(videoId, host);
+      return await fromPlayerApi(videoId, host, spec);
     } catch (error) {
       lastError = error;
     }
   }
-  // 429 é temporário: uma segunda rodada depois de alguns segundos.
+
+  // 429 é temporário: uma segunda rodada rápida depois de alguns segundos.
   if (/429/.test(lastError?.message || '')) {
     await wait(4000);
-    for (const host of PLAYER_HOSTS) {
+    for (const spec of PLAYER_CLIENTS) {
       try {
-        return await fromPlayerApi(videoId, host);
+        return await fromPlayerApi(videoId, PLAYER_HOSTS[0], spec);
       } catch (error) {
         lastError = error;
       }
     }
   }
+
   try {
     return await fromWatchPage(videoId);
   } catch (error) {
