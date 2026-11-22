@@ -406,7 +406,7 @@ async function addTrack(room, input, requestedBy, ws) {
   if (userKeys.length > 200) delete room.userRequests[userKeys[0]];
 
   // Dispara a medição de loudness em segundo plano; o resultado chega depois pelo state.
-  autoGain(room, track.videoId);
+  autoGain(room, track);
 
   // A música anterior acabou sem fila: este pedido vira a próxima automaticamente.
   if (ended) playNext(room);
@@ -423,7 +423,8 @@ function clampGain(value) {
 
 // Preenche o ganho automaticamente com base na loudness medida da faixa.
 // O valor manual do DJ sempre tem prioridade.
-function autoGain(room, videoId) {
+function autoGain(room, track) {
+  const videoId = track?.videoId;
   if (!loudnessEnabled || !videoId) return;
   measureVideoLoudness(videoId).then((result) => {
     if (!result || !rooms.has(room.code)) return;
@@ -433,6 +434,16 @@ function autoGain(room, videoId) {
     if (room.gains[videoId] === result.gain) return;
     room.gains[videoId] = result.gain;
     broadcastState(room);
+
+    // Aviso só para o DJ: deixa claro que o volume foi ajustado pela medição.
+    const host = [...room.clients].find((client) => client.clientId === room.hostId);
+    if (!host) return;
+    const arrow = result.gain < 1 ? '↓' : result.gain > 1 ? '↑' : '=';
+    const title = String(track.title || videoId).slice(0, 60);
+    send(host, {
+      type: 'toast',
+      text: `🔊 ${arrow} Volume de “${title}” ajustado automaticamente para ${Math.round(result.gain * 100)}%`,
+    });
   });
 }
 
