@@ -725,6 +725,8 @@ const CHAT_CONTROLS = {
   $voltar: previousRoom, '!voltar': previousRoom, $previous: previousRoom,
 };
 
+const HELP_COMMANDS = new Set(['$comandos', '!comandos', '$help', '!help', '$ajuda', '!ajuda']);
+
 const twitchDeniedAt = new Map();
 
 function canControlFromChat(tags, username) {
@@ -772,6 +774,14 @@ function handleTwitchLine(line) {
 
   const [command, ...rest] = message.trim().split(/\s+/);
   const cmd = (command || '').toLowerCase();
+
+  // Ajuda rápida, separando o que qualquer pessoa pode usar do que é só para mods.
+  if (HELP_COMMANDS.has(cmd)) {
+    const pedidos = TWITCH.commands.join(' / ');
+    replyTwitch(`Comandos para todos: ${pedidos} (nome ou link) · $lista [@usuario] (pedidos/ranking) · $comandos (esta ajuda)`);
+    replyTwitch('Só moderadores/broadcaster: $pausar, $pular, $voltar (ou $pause, $next, $previous).');
+    return;
+  }
 
   // Moderadores (e o broadcaster) controlam o player sem precisar entrar na sala.
   const control = CHAT_CONTROLS[cmd];
