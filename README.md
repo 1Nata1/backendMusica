@@ -18,7 +18,16 @@ você cria uma sala, cola um link do YouTube e todo mundo que entrou pelo link o
 - **Sincronização tolerante a atraso** — se alguém entrar no meio da música, o player
   começa no segundo correto.
 - **Volume individual** — cada pessoa ajusta o próprio volume; não afeta os outros.
+- **Normalização de volume** — o servidor mede a loudness de cada música e ajusta o ganho
+  automaticamente para todos. O DJ ainda pode corrigir com `−`, `+`, `↺` no painel da faixa;
+  o ajuste manual sempre tem prioridade.
 - **Chat da sala** com mensagens e avisos do sistema.
+- **Letra sincronizada** — painel embaixo do player destaca o verso atual usando a mesma
+  posição do servidor; funciona para o DJ e para os ouvintes. As letras vêm do LRCLIB
+  (gratuito, sem chave) e ficam cacheadas no navegador.
+- **Aguardando o próximo pedido** — se a música acabar e a fila estiver vazia, a sala entra
+  em modo de espera e o próximo pedido (pelo site ou pelo `$sr`) começa a tocar sozinho,
+  sem precisar apertar play.
 
 ## Como funciona
 
@@ -111,6 +120,10 @@ ainda vale o aviso de "acordar" antes da live.
 3. Clique em **Ativar e ouvir** (obrigatório: navegadores bloqueiam áudio automático).
 4. Digite o nome da música na fila (ou `!sr nome da música` no chat). O primeiro vídeo entra automaticamente.
 5. Quem entrar depois também clica em **Ativar e ouvir** e escuta a partir do ponto atual.
+6. O volume de cada música é medido e equilibrado automaticamente. Se ainda assim alguma
+   estiver alta ou baixa, use o painel **🔊 Volume da faixa**: `−` diminui 10%, `+` aumenta
+   10% e `↺` volta a 100%. O ajuste vale para aquela música em todas as pessoas da sala e
+   fica salvo para quando ela tocar de novo.
 
 Dica para OBS: se quiser que o áudio entre na transmissão, pegue a **saída de áudio do
 navegador do DJ** no OBS (ex.: `WINDOWS/graphics-capture` com "capurar áudio" ativado).
@@ -127,18 +140,19 @@ no Render ou liberar a porta na rede.
 
 ### 4.1. Gerar o token OAuth
 
-Use uma **conta bot** (recomendado) ou a sua própria conta de Twitch. O token precisa
-dos escopos `chat:read` e `chat:write`.
+Use uma **conta bot** ou a sua própria conta de Twitch. Para IRC os escopos necessários
+são `chat:read` (ler mensagens) e `chat:edit` (responder) — são os nomes oficiais da Twitch;
+`chat:write` é o nome usado pela API HTTP, não pelo IRC.
 
-- **Forma rápida:** entre em <https://twitchapps.com/tmi/> com a conta desejada, clique
-  em **Connect**, autorize e copie o token (começa com `oauth:`). É um serviço de
-  terceiros — se preferir não usá-lo, use a opção abaixo.
+- **Forma rápida:** <https://twitchtokengenerator.com/> → **Bot Chat Token** → autorize
+  com a conta desejada → copie o **Access token**. Se ele vier sem `oauth:`, adicione o
+  prefixo na hora de preencher `TWITCH_OAUTH_TOKEN`. (O antigo twitchapps.com/tmi/ foi
+  descontinuado.) É um serviço de terceiros — se preferir não usá-lo, use a opção abaixo.
 - **Forma oficial:** instale a [Twitch CLI](https://dev.twitch.tv/docs/cli/) e rode:
   ```bash
-  twitch login
-  twitch token -u -s "chat:read chat:write"
+  twitch token -u -s "chat:read chat:edit"
   ```
-  Copie o token exibido.
+  Copie o token exibido e adicione o prefixo `oauth:` se necessário.
 
 ### 4.2. Configurar
 
@@ -151,6 +165,7 @@ TWITCH_OAUTH_TOKEN=oauth:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 TWITCH_ROOM=LIVE23
 TWITCH_SR_COMMANDS=$sr,!sr
 TWITCH_CHAT_REPLY=true
+TWITCH_ADMINS=outraconta,amigo   # opcional
 ```
 
 - `TWITCH_CHANNEL`: canal que o bot vai ler, sem `#`.
@@ -158,6 +173,8 @@ TWITCH_CHAT_REPLY=true
 - `TWITCH_ROOM`: código fixo da sala. O servidor **cria essa sala sozinho** ao iniciar.
   Abra `http://localhost:3000/r/LIVE23` e compartilhe esse link com seus amigos.
 - `TWITCH_SR_COMMANDS`: aceita `$sr` e `!sr` por padrão (não conflita com os `!` do Nightbot).
+- `TWITCH_ADMINS`: opcional. Moderadores e o broadcaster já podem controlar o player pelo
+  chat; use esta variável para autorizar contas extras.
 
 Reinicie o servidor (`npm start`). No console deve aparecer:
 
@@ -178,7 +195,48 @@ $sr bohemian rhapsody queen
 O bot responde `✅ Queen – Bohemian Rhapsody (Official Video Remastered) adicionado à fila por @voce`
 e a música aparece na fila do DJ Sync para todo mundo.
 
-### 4.4. Problemas comuns
+Digite `$comandos` (ou `$help`, `$ajuda`, com `!` também) para o bot responder com a lista
+atualizada, já separando o que qualquer pessoa pode usar do que é exclusivo dos moderadores.
+
+Quando a música termina, a próxima da fila começa automaticamente para todo mundo. Para
+isso, o DJ precisa manter a aba aberta e ter clicado em **Ativar e ouvir** (os navegadores
+só permitem áudio depois de um clique). Se a fila estiver vazia, a sala entra em modo
+**aguardando o próximo pedido**: o próximo `$sr` (ou pedido pelo site) começa tocando sozinho.
+
+### 4.4. Controlar o player pelo chat (moderadores)
+
+Moderadores e o broadcaster do canal podem controlar o player **sem entrar na sala como DJ**:
+
+```
+$pausar    # pausa para todos
+$pular     # toca a próxima da fila
+$voltar    # volta para a música anterior
+```
+
+Os aliases `!pausar`, `!pular`, `!voltar`, `$pause`, `$next` e `$previous` também funcionam.
+O bot confirma no chat, por exemplo: `⏭️ Tocando agora: PSY – GANGNAM STYLE... (por @moduser)`.
+Qualquer outra pessoa recebe `@user: esse comando é só para moderadores do chat.` (no máximo
+uma vez a cada 30 s, para não floodingar o chat). Para autorizar contas extras, use
+`TWITCH_ADMINS`.
+
+### 4.5. Histórico de pedidos por pessoa (gosto musical)
+
+Todo pedido (do chat da Twitch, do `!sr` da sala ou do campo da fila) fica guardado com o
+nome de quem pediu. No site, o painel **Gosto musical** mostra cada pessoa e suas músicas;
+o botão **+ fila** coloca uma música antiga de volta na fila, para tocar em outro momento.
+
+No chat da Twitch:
+
+```
+$lista @eagle     # últimos pedidos de eagle
+$lista            # ranking de quem mais pediu
+```
+
+Os nomes `!lista`, `$list` e `!list` também funcionam. O histórico é guardado no servidor
+enquanto ele estiver no ar e também no navegador do DJ. Se o servidor reiniciar (plano free
+da Render), o DJ reconstrói o histórico automaticamente ao entrar na sala.
+
+### 4.6. Problemas comuns
 
 | Sintoma | Causa provável |
 |---------|----------------|
@@ -187,7 +245,36 @@ e a música aparece na fila do DJ Sync para todo mundo.
 | Bot conecta mas não responde | Confira `TWITCH_CHANNEL` (minúsculas, sem `#`) e se `TWITCH_CHAT_REPLY` não é `false`. |
 | Responde "sala ainda não está aberta" | `TWITCH_ROOM` diferente da sala usada no site. |
 | Responde que os pedidos estão desativados | O DJ desmarcou **Permitir pedidos da fila** na interface. |
+| Moderador recebe "só para moderadores" | A conta não tem badge de mod no canal, ou o bot reconectou antes do `CAP REQ :twitch.tv/tags`. Adicione a conta em `TWITCH_ADMINS` como alternativa. |
 | Não quer resposta no chat | `TWITCH_CHAT_REPLY=false` (necessário se o token só tiver `chat:read`). |
+
+## Normalização automática de volume (LUFS)
+
+O player do YouTube é um iframe e não permite ler o áudio da página. Em vez de baixar o
+vídeo (o YouTube bloqueia IPs de datacenter com "Sign in to confirm you're not a bot"),
+o servidor lê a loudness integrada que o próprio YouTube publica na página do vídeo:
+
+1. O servidor abre `youtube.com/watch?v=...` e lê o `ytInitialPlayerResponse`.
+2. Dele tira `playerConfig.audioConfig.trackAbsoluteLoudnessLkfs` — o nível médio da faixa
+   em LUFS, calculado pelo próprio YouTube. Não precisa de `yt-dlp`, `ffmpeg` ou cookies.
+3. O servidor calcula o ganho para chegar a **−16 LUFS**, salva no mapa `gains` por `videoId`
+   e manda para todos os ouvintes. O valor entra com um fade curto para não dar solavanco.
+4. O resultado fica em cache: vídeos repetidos não são medidos de novo. Se falhar, o ajuste
+   manual continua funcionando normalmente.
+
+Variáveis opcionais:
+
+| Variável | Padrão | O que faz |
+|----------|--------|-----------|
+| `DJ_SYNC_LOUDNESS` | `true` | `false` desativa a medição automática. |
+| `DJ_SYNC_TARGET_LUFS` | `-16` | Nível alvo. Quanto mais negativo, mais baixo o resultado. |
+
+Quando o ajuste acontece, o painel mostra um selo com a seta e o percentual (ex.: `↓ 53%`) e
+o DJ recebe um aviso: `🔊 ↓ Volume de "..." ajustado automaticamente para 47%`.
+
+Ajustes feitos pelo DJ no painel **🔊 Volume da faixa** nunca são sobrescritos pela medição.
+A leitura pode demorar alguns segundos e, raramente, falhar se o YouTube não devolver os dados
+da página — nesses casos o ganho simplesmente não muda.
 
 ## Busca por nome e links aceitos
 

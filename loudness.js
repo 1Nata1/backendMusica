@@ -1,16 +1,14 @@
 'use strict';
 
 // Medição de loudness (LUFS) de um vídeo do YouTube.
-// O player do IFrame não expõe áudio, então baixamos uma amostra com yt-dlp e
-// usamos o filtro loudnorm do ffmpeg para descobrir o nível médio da faixa.
-
-const { spawn } = require('child_process');
-const ffmpegPath = require('ffmpeg-static');
-const ytdl = require('youtube-dl-exec');
+// O player do IFrame não expõe áudio, então não dá para medir no navegador.
+// Em vez de baixar o vídeo (o YouTube bloqueia IPs de datacenter com "not a bot"),
+// lemos a loudness integrada que o próprio YouTube publica na página do vídeo:
+// playerConfig.audioConfig.trackAbsoluteLoudnessLkfs.
 
 const ENABLED = process.env.DJ_SYNC_LOUDNESS !== 'false';
 const TARGET_LUFS = Number(process.env.DJ_SYNC_TARGET_LUFS || -16);
-const SAMPLE_SECONDS = Math.max(10, Math.min(120, Number(process.env.DJ_SYNC_LOUDNESS_SAMPLE || 40)));
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win32; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36';
 
 const cache = new Map();   // videoId → { lufs, gain }
 const failed = new Map();  // videoId → timestamp (evita repetir falhas)
@@ -43,71 +41,54 @@ function enqueue(run) {
   });
 }
 
-function withTimeout(promise, ms, label) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label} expirou`)), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+// Extrai um objeto JSON grande do HTML sem depender de regex "até o primeiro };".
+function extractJsonObject(html, marker) {
+  const start = html.indexOf(marker);
+  if (start < 0) return null;
+  const open = html.indexOf('{', start + marker.length);
+  if (open < 0) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = open; i < html.length; i++) {
+    const ch = html[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) return html.slice(open, i + 1);
+    }
+  }
+  return null;
 }
 
-async function extractAudioUrl(videoId) {
-  const output = await withTimeout(
-    ytdl(`https://www.youtube.com/watch?v=${videoId}`, {
-      format: 'bestaudio/best',
-      getUrl: true,
-      noPlaylist: true,
-      quiet: true,
-      noWarnings: true,
-    }),
-    30000,
-    'yt-dlp'
-  );
-  const url = String(output).trim().split(/\r?\n/).find(Boolean);
-  if (!url || !/^https?:\/\//.test(url)) throw new Error('URL de áudio inválida');
-  return url;
-}
-
-function measureLufs(url) {
-  return new Promise((resolve, reject) => {
-    const args = [
-      '-nostdin', '-hide_banner', '-v', 'info',
-      '-i', url, '-t', String(SAMPLE_SECONDS),
-      '-af', `loudnorm=I=${TARGET_LUFS}:TP=-1.5:LRA=11:print_format=json`,
-      '-f', 'null', '-',
-    ];
-    const child = spawn(ffmpegPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
-    let stderr = '';
-    let done = false;
-
-    const timer = setTimeout(() => {
-      if (done) return;
-      done = true;
-      child.kill('SIGKILL');
-      reject(new Error('ffmpeg expirou'));
-    }, 60000);
-
-    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
-    child.on('error', (error) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      reject(error);
-    });
-    child.on('close', () => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      try {
-        const json = stderr.match(/\{\s*"input_i"[\s\S]*?\}/)?.[0];
-        const lufs = Number(json ? JSON.parse(json).input_i : NaN);
-        if (!Number.isFinite(lufs)) throw new Error('LUFS não encontrado');
-        resolve(lufs);
-      } catch (error) {
-        reject(error);
-      }
-    });
+async function fetchTrackLufs(videoId) {
+  const response = await fetch(`https://www.youtube.com/watch?v=${videoId}&hl=pt`, {
+    headers: {
+      'User-Agent': USER_AGENT,
+      'Accept-Language': 'pt-BR,pt;q=0.9',
+    },
+    signal: AbortSignal.timeout(20000),
   });
+  if (!response.ok) throw new Error(`YouTube respondeu ${response.status}`);
+
+  const html = await response.text();
+  const json = extractJsonObject(html, 'ytInitialPlayerResponse');
+  if (!json) throw new Error('resposta do player não encontrada');
+
+  const data = JSON.parse(json);
+  const audio = data.playerConfig?.audioConfig || {};
+  const lufs = Number(audio.trackAbsoluteLoudnessLkfs ?? audio.perceptualLoudnessDb);
+  if (!Number.isFinite(lufs)) throw new Error('loudness não encontrada');
+  return lufs;
 }
 
 function measureVideoLoudness(videoId) {
@@ -121,8 +102,7 @@ function measureVideoLoudness(videoId) {
   if (pending.has(id)) return pending.get(id);
 
   const job = enqueue(async () => {
-    const url = await extractAudioUrl(id);
-    const lufs = await measureLufs(url);
+    const lufs = await fetchTrackLufs(id);
     const gain = clampGain(10 ** ((TARGET_LUFS - lufs) / 20));
     const result = { lufs, gain };
     cache.set(id, result);
@@ -140,4 +120,4 @@ function measureVideoLoudness(videoId) {
   return job;
 }
 
-module.exports = { measureVideoLoudness, loudnessEnabled: ENABLED, TARGET_LUFS, SAMPLE_SECONDS };
+module.exports = { measureVideoLoudness, loudnessEnabled: ENABLED, TARGET_LUFS };
