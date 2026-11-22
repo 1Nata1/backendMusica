@@ -61,6 +61,7 @@ function createRoom(code = makeCode()) {
     emptySince: null,
     current: null,
     playing: false,
+    ended: false, // música acabou sem nada na fila: espera o próximo pedido
     position: 0,
     updatedAt: Date.now(),
     queue: [],
@@ -107,6 +108,7 @@ function stateFor(room, ws) {
     code: room.code,
     current: room.current,
     playing: room.playing,
+    ended: Boolean(room.ended),
     position: currentPosition(room),
     serverTime: Date.now(),
     queue: room.queue,
@@ -362,7 +364,9 @@ async function addTrack(room, input, requestedBy, ws) {
   }
 
   if (!rooms.has(room.code)) return;
-  if (room.queue.some((t) => t.videoId === track.videoId) || room.current?.videoId === track.videoId) {
+  const ended = Boolean(room.ended);
+  if (room.queue.some((t) => t.videoId === track.videoId) ||
+      (room.current?.videoId === track.videoId && !ended)) {
     toast(ws, 'Essa música já está na fila.');
     return;
   }
@@ -394,6 +398,9 @@ async function addTrack(room, input, requestedBy, ws) {
   const userKeys = Object.keys(room.userRequests);
   if (userKeys.length > 200) delete room.userRequests[userKeys[0]];
 
+  // A música anterior acabou sem fila: este pedido vira a próxima automaticamente.
+  if (ended) playNext(room);
+
   systemMessage(room, `${requestedBy} adicionou: ${track.title}`);
   return track;
 }
@@ -404,6 +411,7 @@ function playNext(room) {
   room.current = room.queue.shift();
   room.position = 0;
   room.playing = true;
+  room.ended = false;
   room.updatedAt = Date.now();
   return true;
 }
@@ -462,6 +470,21 @@ function handleAction(ws, room, msg) {
       sendState(ws, room);
       break;
 
+    // O player do DJ avisou que a música terminou. Se houver fila, avança;
+    // senão fica "aguardando" e o próximo pedido começa sozinho.
+    case 'ended': {
+      if (!requireHost(room, ws)) return;
+      if (!room.playing || !room.current) return;
+      if (msg.videoId && room.current.videoId !== msg.videoId) return;
+      if (!playNext(room)) {
+        room.playing = false;
+        room.ended = true;
+        room.updatedAt = Date.now();
+      }
+      broadcastState(room);
+      break;
+    }
+
     case 'play':
       if (!requireHost(room, ws)) return;
       if (!room.current && !playNext(room)) {
@@ -469,6 +492,7 @@ function handleAction(ws, room, msg) {
         return;
       }
       room.playing = true;
+      room.ended = false;
       room.updatedAt = Date.now();
       broadcastState(room);
       break;
@@ -477,6 +501,7 @@ function handleAction(ws, room, msg) {
       if (!requireHost(room, ws)) return;
       room.position = currentPosition(room);
       room.playing = false;
+      room.ended = false;
       room.updatedAt = Date.now();
       broadcastState(room);
       break;
@@ -497,6 +522,7 @@ function handleAction(ws, room, msg) {
       room.current = room.history.pop();
       room.position = 0;
       room.playing = true;
+      room.ended = false;
       room.updatedAt = Date.now();
       broadcastState(room);
       break;
@@ -506,6 +532,7 @@ function handleAction(ws, room, msg) {
       const seconds = Number(msg.position);
       if (!Number.isFinite(seconds) || seconds < 0 || seconds > 12 * 3600) return;
       room.position = seconds;
+      room.ended = false;
       room.updatedAt = Date.now();
       broadcastState(room);
       break;
