@@ -7,6 +7,8 @@
 // playerConfig.audioConfig.trackAbsoluteLoudnessLkfs (loudness integrada do YouTube).
 
 const ENABLED = process.env.DJ_SYNC_LOUDNESS !== 'false';
+// Com o medidor local, o Render não precisa tentar o YouTube (IP bloqueado).
+const SERVER_MEASURE = process.env.DJ_SYNC_LOUDNESS_SERVER_MEASURE !== 'false';
 const TARGET_LUFS = Number(process.env.DJ_SYNC_TARGET_LUFS || -16);
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
@@ -18,6 +20,13 @@ let active = 0;
 const MAX_ACTIVE = 2;
 
 let innertube = { key: null, version: null, sts: 0, visitor: null, cookie: null, fetchedAt: 0 };
+
+// API externa (KeyAPI): sai de outro IP e devolve o playerResponse bruto do YouTube.
+// 100 créditos grátis no cadastro; um crédito por vídeo novo (o cache evita repetir).
+const API_KEY = String(process.env.DJ_SYNC_LOUDNESS_API_KEY || '').trim();
+const API_URL = process.env.DJ_SYNC_LOUDNESS_API_URL || 'https://api.keyapi.ai/v1/youtube/get_video_info';
+if (API_KEY) console.log(`Loudness: usando API externa (${API_URL.split('/')[2]})`);
+if (ENABLED && !SERVER_MEASURE) console.log('Loudness: medição no servidor desativada (aguardando medidor local)');
 
 // Função na Vercel: sai com outro IP, útil quando o Render é bloqueado pelo YouTube.
 const PROXY_URL = process.env.DJ_SYNC_LOUDNESS_PROXY || 'https://teste-de-musica.vercel.app/api/loudness';
@@ -122,6 +131,42 @@ async function fromPlayerApi(videoId, host, spec) {
   }
 }
 
+// A resposta da KeyAPI embrulha o playerResponse do YouTube. Em vez de depender
+// do formato do envelope, procuramos o campo diretamente no JSON inteiro.
+function findLoudnessInJson(value) {
+  if (!value || typeof value !== 'object') return null;
+  const audio = value.playerConfig?.audioConfig;
+  if (audio) {
+    const lufs = Number(audio.trackAbsoluteLoudnessLkfs ?? audio.perceptualLoudnessDb);
+    if (Number.isFinite(lufs)) return lufs;
+  }
+  for (const child of Object.values(value)) {
+    const found = findLoudnessInJson(child);
+    if (found !== null) return found;
+  }
+  return null;
+}
+
+async function fromExternalApi(videoId) {
+  if (!API_KEY) throw new Error('sem chave de API');
+  const separator = API_URL.includes('?') ? '&' : '?';
+  const response = await fetch(`${API_URL}${separator}video_id=${encodeURIComponent(videoId)}`, {
+    headers: { Authorization: `Bearer ${API_KEY}`, Accept: 'application/json' },
+    signal: AbortSignal.timeout(25000),
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`API externa respondeu ${response.status}: ${text.slice(0, 100)}`);
+
+  let data;
+  try { data = JSON.parse(text); } catch { throw new Error('API externa devolveu JSON inválido'); }
+  const lufs = findLoudnessInJson(data);
+  if (lufs === null) {
+    const playability = data?.data?.playabilityStatus?.status || data?.playabilityStatus?.status || 'desconhecido';
+    throw new Error(`API externa sem loudness (${playability})`);
+  }
+  return lufs;
+}
+
 async function fromVercelProxy(videoId) {
   const response = await fetch(`${PROXY_URL}?id=${encodeURIComponent(videoId)}`, {
     headers: { 'User-Agent': USER_AGENT },
@@ -182,7 +227,15 @@ const PLAYER_HOSTS = [
 ];
 
 async function fetchTrackLufs(videoId) {
-  // Primeiro tenta a Vercel (outro IP); depois os hosts diretos; por fim o /watch.
+  // Ordem: API externa (IP próprio), proxy da Vercel, hosts diretos, página /watch.
+  if (API_KEY) {
+    try {
+      return await fromExternalApi(videoId);
+    } catch (error) {
+      console.error(`Loudness: API externa falhou para ${videoId} — ${error.message}`);
+    }
+  }
+
   try {
     return await fromVercelProxy(videoId);
   } catch (error) {
@@ -225,7 +278,7 @@ async function fetchTrackLufs(videoId) {
 }
 
 function measureVideoLoudness(videoId) {
-  if (!ENABLED) return Promise.resolve(null);
+  if (!ENABLED || !SERVER_MEASURE) return Promise.resolve(null);
   const id = String(videoId || '');
   if (!/^[A-Za-z0-9_-]{11}$/.test(id)) return Promise.resolve(null);
   if (cache.has(id)) return Promise.resolve(cache.get(id));
@@ -253,4 +306,26 @@ function measureVideoLoudness(videoId) {
   return job;
 }
 
-module.exports = { measureVideoLoudness, loudnessEnabled: ENABLED, TARGET_LUFS };
+// Recebe uma medição feita pelo medidor local (IP residencial) e guarda no mesmo
+// cache usado pela medição do servidor, sem gastar crédito de API externa.
+function rememberLoudness(videoId, lufs) {
+  if (!ENABLED) return null;
+  const id = String(videoId || '');
+  const value = Number(lufs);
+  if (!/^[A-Za-z0-9_-]{11}$/.test(id) || !Number.isFinite(value) || value < -80 || value > 10) return null;
+
+  const gain = clampGain(10 ** ((TARGET_LUFS - value) / 20));
+  const result = { lufs: value, gain };
+  cache.set(id, result);
+  failed.delete(id);
+  console.log(`Loudness local: ${id} = ${value.toFixed(2)} LUFS → ganho ${Math.round(gain * 100)}%`);
+  return result;
+}
+
+module.exports = {
+  measureVideoLoudness,
+  rememberLoudness,
+  loudnessEnabled: ENABLED,
+  serverMeasureEnabled: SERVER_MEASURE,
+  TARGET_LUFS,
+};

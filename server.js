@@ -7,12 +7,14 @@ const http = require('http');
 const path = require('path');
 const crypto = require('crypto');
 const { WebSocketServer, WebSocket } = require('ws');
-const { measureVideoLoudness, loudnessEnabled } = require('./loudness');
+const { measureVideoLoudness, rememberLoudness, loudnessEnabled, serverMeasureEnabled } = require('./loudness');
 
 const PORT = process.env.PORT || 3000;
 const SYNC_INTERVAL_MS = 5000;
 const HOST_GRACE_MS = 15000;
 const EMPTY_ROOM_TTL_MS = 30 * 60 * 1000;
+// Segredo compartilhado com o medidor que roda no PC do DJ.
+const LOCAL_METER_TOKEN = String(process.env.DJ_SYNC_LOCAL_METER_TOKEN || '').trim();
 
 const TWITCH = {
   channel: (process.env.TWITCH_CHANNEL || '').replace(/^#/, '').trim().toLowerCase(),
@@ -36,7 +38,7 @@ app.use(express.json());
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Meter-Token');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -154,6 +156,47 @@ function systemMessage(room, text) {
 
 function toast(ws, text) {
   send(ws, { type: 'toast', text });
+}
+
+// Encontra a faixa em qualquer lista da sala, para usar o título no aviso do DJ.
+function findTrack(room, videoId) {
+  const candidates = [
+    room.current,
+    ...(room.queue || []),
+    ...(room.history || []).slice(-30),
+  ];
+  for (const track of candidates) {
+    if (track?.videoId === videoId) return track;
+  }
+  for (const tracks of Object.values(room.userRequests || {})) {
+    const found = (tracks || []).find((track) => track?.videoId === videoId);
+    if (found) return found;
+  }
+  return null;
+}
+
+// Aplica um resultado de loudness (servidor ou medidor local), respeitando o ajuste manual.
+function applyAutomaticGain(room, videoId, result, trackTitle) {
+  if (!result || !rooms.has(room.code)) return false;
+  if (!room.manualGains) room.manualGains = new Set();
+  if (room.manualGains.has(videoId)) return false;
+  if (!room.gains) room.gains = {};
+  if (Number.isFinite(Number(room.gains[videoId]))) return false;
+
+  room.gains[videoId] = result.gain;
+  broadcastState(room);
+
+  // Aviso só para o DJ: deixa claro que o volume foi ajustado pela medição.
+  const host = [...room.clients].find((client) => client.clientId === room.hostId);
+  if (host) {
+    const arrow = result.gain < 1 ? '↓' : result.gain > 1 ? '↑' : '=';
+    const title = String(trackTitle || videoId).slice(0, 60);
+    send(host, {
+      type: 'toast',
+      text: `🔊 ${arrow} Volume de “${title}” ajustado automaticamente para ${Math.round(result.gain * 100)}%`,
+    });
+  }
+  return true;
 }
 
 function parseYouTubeId(input) {
@@ -426,24 +469,15 @@ function clampGain(value) {
 function autoGain(room, track) {
   const videoId = track?.videoId;
   if (!loudnessEnabled || !videoId) return;
-  measureVideoLoudness(videoId).then((result) => {
-    if (!result || !rooms.has(room.code)) return;
-    if (!room.manualGains) room.manualGains = new Set();
-    if (room.manualGains.has(videoId)) return;
-    if (!room.gains) room.gains = {};
-    if (room.gains[videoId] === result.gain) return;
-    room.gains[videoId] = result.gain;
-    broadcastState(room);
+  if (!room.manualGains) room.manualGains = new Set();
+  // Ganho manual ou já restaurado do navegador: não medir de novo (economiza crédito/API).
+  if (room.manualGains.has(videoId)) return;
+  if (Number.isFinite(Number(room.gains?.[videoId]))) return;
+  // No modo com medidor local, a sala fica pendente até o PC responder.
+  if (!serverMeasureEnabled) return;
 
-    // Aviso só para o DJ: deixa claro que o volume foi ajustado pela medição.
-    const host = [...room.clients].find((client) => client.clientId === room.hostId);
-    if (!host) return;
-    const arrow = result.gain < 1 ? '↓' : result.gain > 1 ? '↑' : '=';
-    const title = String(track.title || videoId).slice(0, 60);
-    send(host, {
-      type: 'toast',
-      text: `🔊 ${arrow} Volume de “${title}” ajustado automaticamente para ${Math.round(result.gain * 100)}%`,
-    });
+  measureVideoLoudness(videoId).then((result) => {
+    applyAutomaticGain(room, videoId, result, track?.title);
   });
 }
 
@@ -686,6 +720,81 @@ function handleAction(ws, room, msg) {
 }
 
 // ---------------------------------------------------------------- HTTP
+
+function meterAuthorized(req, res) {
+  if (!LOCAL_METER_TOKEN) {
+    res.status(503).json({ error: 'Medidor local não configurado no servidor' });
+    return false;
+  }
+  const bearer = /^Bearer\s+/i.test(String(req.headers.authorization || ''))
+    ? String(req.headers.authorization).replace(/^Bearer\s+/i, '').trim()
+    : '';
+  const token = bearer || String(req.headers['x-meter-token'] || '') || String(req.query.token || '') || String(req.body?.token || '');
+  if (token !== LOCAL_METER_TOKEN) {
+    res.status(401).json({ error: 'Token do medidor inválido' });
+    return false;
+  }
+  return true;
+}
+
+function validVideoId(value) {
+  const id = String(value || '').trim();
+  return /^[A-Za-z0-9_-]{11}$/.test(id) ? id : null;
+}
+
+// Músicas da sala que ainda precisam de medição (current + fila + histórico recente).
+app.get('/api/loudness/pending', (req, res) => {
+  if (!meterAuthorized(req, res)) return;
+  const code = String(req.query.room || '').toUpperCase();
+  const targets = code ? (getRoom(code) ? [getRoom(code)] : []) : [...rooms.values()];
+  if (code && !targets.length) return res.status(404).json({ error: 'Sala não encontrada' });
+
+  const ids = new Set();
+  for (const room of targets) {
+    if (!room.manualGains) room.manualGains = new Set();
+    if (!room.gains) room.gains = {};
+    const tracks = [room.current, ...(room.queue || []), ...(room.history || []).slice(-15)];
+    for (const track of tracks) {
+      const id = validVideoId(track?.videoId);
+      if (!id || room.manualGains.has(id)) continue;
+      if (Number.isFinite(Number(room.gains[id]))) continue;
+      ids.add(id);
+    }
+  }
+  res.json({ ok: true, enabled: loudnessEnabled, room: code || null, pending: [...ids].slice(0, 60) });
+});
+
+// O medidor local (IP residencial) devolve aqui o LUFS medido.
+app.post('/api/loudness/report', (req, res) => {
+  if (!meterAuthorized(req, res)) return;
+  const videoId = validVideoId(req.body?.videoId);
+  const lufs = Number(req.body?.lufs);
+  if (!videoId || !Number.isFinite(lufs)) {
+    return res.status(400).json({ error: 'Envie videoId e lufs válidos' });
+  }
+
+  const result = rememberLoudness(videoId, lufs);
+  if (!result) return res.status(400).json({ error: 'Medição inválida' });
+
+  const code = String(req.body?.room || req.query.room || '').toUpperCase();
+  const targets = code ? (getRoom(code) ? [getRoom(code)] : []) : [...rooms.values()];
+  if (code && !targets.length) return res.status(404).json({ error: 'Sala não encontrada' });
+
+  let updated = 0;
+  for (const room of targets) {
+    const track = findTrack(room, videoId);
+    if (!track) continue;
+    if (applyAutomaticGain(room, videoId, result, track.title)) updated++;
+  }
+
+  res.json({
+    ok: true,
+    videoId,
+    lufs: result.lufs,
+    gain: result.gain,
+    updated,
+  });
+});
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true, rooms: rooms.size, uptime: Math.floor(process.uptime()) });
