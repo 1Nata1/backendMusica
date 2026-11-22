@@ -13,6 +13,8 @@ const PORT = process.env.PORT || 3000;
 const SYNC_INTERVAL_MS = 5000;
 const HOST_GRACE_MS = 15000;
 const EMPTY_ROOM_TTL_MS = 30 * 60 * 1000;
+// Sala fixa da live: nunca é apagada pela limpeza de salas vazias.
+const FIXED_ROOM = 'LIVE23';
 // Segredo compartilhado com o medidor que roda no PC do DJ.
 const LOCAL_METER_TOKEN = String(process.env.DJ_SYNC_LOCAL_METER_TOKEN || '').trim();
 
@@ -1108,6 +1110,8 @@ function broadcastSyncTicks() {
 
 setInterval(() => {
   for (const [code, room] of rooms) {
+    // A sala da live e a sala do bot da Twitch existem sempre, mesmo vazias.
+    if (code === FIXED_ROOM || code === TWITCH.room) continue;
     if (!room.clients.size && room.emptySince && Date.now() - room.emptySince > EMPTY_ROOM_TTL_MS) {
       clearTimeout(room.hostTimer);
       rooms.delete(code);
@@ -1126,10 +1130,12 @@ process.on('SIGTERM', () => {
 });
 
 server.listen(PORT, () => {
-  // Sala fixa usada pelo bot da Twitch (nunca expira por inatividade)
+  // Sala fixa da live: criada no boot e preservada pela limpeza automática.
+  if (!rooms.has(FIXED_ROOM)) rooms.set(FIXED_ROOM, createRoom(FIXED_ROOM));
   if (TWITCH.room && !rooms.has(TWITCH.room)) rooms.set(TWITCH.room, createRoom(TWITCH.room));
 
   console.log(`DJ Sync rodando em http://localhost:${PORT}`);
+  console.log(`Sala fixa: ${FIXED_ROOM} → http://localhost:${PORT}/r/${FIXED_ROOM}`);
   if (TWITCH.room) console.log(`Sala da Twitch: ${TWITCH.room} → http://localhost:${PORT}/r/${TWITCH.room}`);
   console.log(loudnessEnabled ? 'Normalização automática de volume: ativada' : 'Normalização automática de volume: desativada');
 
