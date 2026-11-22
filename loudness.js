@@ -72,9 +72,9 @@ function loudnessOf(data) {
   return lufs;
 }
 
-async function fromPlayerApi(videoId) {
+async function fromPlayerApi(videoId, host) {
   const { key, version, sts, visitor } = await getInnertube();
-  const response = await fetch(`https://www.youtube.com/youtubei/v1/player?key=${key}&prettyPrint=false`, {
+  const response = await fetch(`${host}/youtubei/v1/player?key=${key}&prettyPrint=false`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -82,7 +82,7 @@ async function fromPlayerApi(videoId) {
       'Accept-Language': 'pt-BR,pt;q=0.9',
       'X-Youtube-Client-Name': '1',
       'X-Youtube-Client-Version': version,
-      Origin: 'https://www.youtube.com',
+      Origin: host,
     },
     body: JSON.stringify({
       context: {
@@ -101,8 +101,12 @@ async function fromPlayerApi(videoId) {
     }),
     signal: AbortSignal.timeout(15000),
   });
-  if (!response.ok) throw new Error(`player API respondeu ${response.status}`);
-  return loudnessOf(await response.json());
+  if (!response.ok) throw new Error(`${host} respondeu ${response.status}`);
+  try {
+    return loudnessOf(await response.json());
+  } catch (error) {
+    throw new Error(`${host}: ${error.message}`);
+  }
 }
 
 // Extrai um objeto JSON grande do HTML sem depender de regex "até o primeiro };".
@@ -146,18 +150,36 @@ async function fromWatchPage(videoId) {
   return loudnessOf(JSON.parse(json));
 }
 
+const PLAYER_HOSTS = [
+  'https://www.youtube.com',
+  'https://www.youtube-nocookie.com',
+  'https://music.youtube.com',
+];
+
 async function fetchTrackLufs(videoId) {
-  try {
-    return await fromPlayerApi(videoId);
-  } catch (error) {
-    // 429 é temporário: tenta de novo uma vez antes de cair para a página do vídeo.
-    if (/429/.test(error.message)) {
-      await wait(4000);
-      try {
-        return await fromPlayerApi(videoId);
-      } catch {}
+  let lastError;
+  for (const host of PLAYER_HOSTS) {
+    try {
+      return await fromPlayerApi(videoId, host);
+    } catch (error) {
+      lastError = error;
     }
-    return fromWatchPage(videoId);
+  }
+  // 429 é temporário: uma segunda rodada depois de alguns segundos.
+  if (/429/.test(lastError?.message || '')) {
+    await wait(4000);
+    for (const host of PLAYER_HOSTS) {
+      try {
+        return await fromPlayerApi(videoId, host);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+  }
+  try {
+    return await fromWatchPage(videoId);
+  } catch (error) {
+    throw new Error(`${lastError?.message || 'player API falhou'} | watch: ${error.message}`);
   }
 }
 
