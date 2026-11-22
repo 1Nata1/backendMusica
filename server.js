@@ -7,6 +7,7 @@ const http = require('http');
 const path = require('path');
 const crypto = require('crypto');
 const { WebSocketServer, WebSocket } = require('ws');
+const { measureVideoLoudness, loudnessEnabled } = require('./loudness');
 
 const PORT = process.env.PORT || 3000;
 const SYNC_INTERVAL_MS = 5000;
@@ -70,6 +71,7 @@ function createRoom(code = makeCode()) {
     history: [],
     // Ganho de volume por vídeo (0.4 a 1.3), compartilhado com todos os ouvintes.
     gains: {},
+    manualGains: new Set(), // vídeos em que o DJ ajustou na mão: a medição não sobrescreve
     //Histórico de pedidos por usuário (chave = nome em minúsculas)
     userRequests: {},
     messages: [],
@@ -403,6 +405,9 @@ async function addTrack(room, input, requestedBy, ws) {
   const userKeys = Object.keys(room.userRequests);
   if (userKeys.length > 200) delete room.userRequests[userKeys[0]];
 
+  // Dispara a medição de loudness em segundo plano; o resultado chega depois pelo state.
+  autoGain(room, track.videoId);
+
   // A música anterior acabou sem fila: este pedido vira a próxima automaticamente.
   if (ended) playNext(room);
 
@@ -414,6 +419,21 @@ function clampGain(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return 1;
   return Math.max(0.4, Math.min(1.3, Math.round(n * 100) / 100));
+}
+
+// Preenche o ganho automaticamente com base na loudness medida da faixa.
+// O valor manual do DJ sempre tem prioridade.
+function autoGain(room, videoId) {
+  if (!loudnessEnabled || !videoId) return;
+  measureVideoLoudness(videoId).then((result) => {
+    if (!result || !rooms.has(room.code)) return;
+    if (!room.manualGains) room.manualGains = new Set();
+    if (room.manualGains.has(videoId)) return;
+    if (!room.gains) room.gains = {};
+    if (room.gains[videoId] === result.gain) return;
+    room.gains[videoId] = result.gain;
+    broadcastState(room);
+  });
 }
 
 function playNext(room) {
@@ -618,6 +638,8 @@ function handleAction(ws, room, msg) {
       const videoId = String(msg.videoId || room.current?.videoId || '').slice(0, 32);
       if (!videoId) return;
       if (!room.gains) room.gains = {};
+      if (!room.manualGains) room.manualGains = new Set();
+      room.manualGains.add(videoId);
       room.gains[videoId] = clampGain(msg.value);
       broadcastState(room);
       break;
@@ -989,6 +1011,7 @@ server.listen(PORT, () => {
 
   console.log(`DJ Sync rodando em http://localhost:${PORT}`);
   if (TWITCH.room) console.log(`Sala da Twitch: ${TWITCH.room} → http://localhost:${PORT}/r/${TWITCH.room}`);
+  console.log(loudnessEnabled ? 'Normalização automática de volume: ativada' : 'Normalização automática de volume: desativada');
 
   if (TWITCH.channel && TWITCH.token && TWITCH.room) {
     connectTwitch();
