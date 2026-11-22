@@ -19,6 +19,8 @@ const TWITCH = {
   token: (process.env.TWITCH_OAUTH_TOKEN || '').trim(),
   room: (process.env.TWITCH_ROOM || '').trim().toUpperCase(),
   commands: (process.env.TWITCH_SR_COMMANDS || '$sr,!sr').split(',').map((c) => c.trim().toLowerCase()).filter(Boolean),
+  // Contas extras autorizadas a controlar o player pelo chat (além de mods e broadcaster).
+  admins: (process.env.TWITCH_ADMINS || '').split(',').map((c) => c.trim().toLowerCase()).filter(Boolean),
   reply: process.env.TWITCH_CHAT_REPLY !== 'false',
   ircUrl: process.env.TWITCH_IRC_URL || 'wss://irc-ws.chat.twitch.tv:443',
 };
@@ -424,6 +426,32 @@ function requireHost(room, ws) {
   return true;
 }
 
+// Ações de controle usadas tanto pelo DJ (WebSocket) quanto pelos moderadores (Twitch).
+// Quem chama decide como avisar o usuário e quando transmitir o novo estado.
+function pauseRoom(room) {
+  room.position = currentPosition(room);
+  room.playing = false;
+  room.ended = false;
+  room.updatedAt = Date.now();
+  return { ok: true, message: '⏸️ Player pausado.' };
+}
+
+function nextRoom(room) {
+  if (!playNext(room)) return { ok: false, message: 'Não há próxima música na fila.' };
+  return { ok: true, message: `⏭️ Tocando agora: ${room.current.title}` };
+}
+
+function previousRoom(room) {
+  if (!room.history.length) return { ok: false, message: 'Não há música anterior.' };
+  if (room.current) room.queue.unshift(room.current);
+  room.current = room.history.pop();
+  room.position = 0;
+  room.playing = true;
+  room.ended = false;
+  room.updatedAt = Date.now();
+  return { ok: true, message: `⏮️ Voltando para: ${room.current.title}` };
+}
+
 function handleAction(ws, room, msg) {
   const name = ws.name;
 
@@ -497,35 +525,29 @@ function handleAction(ws, room, msg) {
       broadcastState(room);
       break;
 
-    case 'pause':
+    case 'pause': {
       if (!requireHost(room, ws)) return;
-      room.position = currentPosition(room);
-      room.playing = false;
-      room.ended = false;
-      room.updatedAt = Date.now();
-      broadcastState(room);
-      break;
-
-    case 'next':
-      if (!requireHost(room, ws)) return;
-      if (!playNext(room)) toast(ws, 'Não há próxima música.');
+      const result = pauseRoom(room);
+      if (!result.ok) toast(ws, result.message);
       else broadcastState(room);
       break;
+    }
 
-    case 'previous':
+    case 'next': {
       if (!requireHost(room, ws)) return;
-      if (!room.history.length) {
-        toast(ws, 'Não há música anterior.');
-        return;
-      }
-      if (room.current) room.queue.unshift(room.current);
-      room.current = room.history.pop();
-      room.position = 0;
-      room.playing = true;
-      room.ended = false;
-      room.updatedAt = Date.now();
-      broadcastState(room);
+      const result = nextRoom(room);
+      if (!result.ok) toast(ws, result.message);
+      else broadcastState(room);
       break;
+    }
+
+    case 'previous': {
+      if (!requireHost(room, ws)) return;
+      const result = previousRoom(room);
+      if (!result.ok) toast(ws, result.message);
+      else broadcastState(room);
+      break;
+    }
 
     case 'seek': {
       if (!requireHost(room, ws)) return;
@@ -697,6 +719,30 @@ function replyTwitch(text) {
   twitchWs.send(`PRIVMSG #${TWITCH.channel} :${clean}`);
 }
 
+const CHAT_CONTROLS = {
+  $pausar: pauseRoom, '!pausar': pauseRoom, $pause: pauseRoom,
+  $pular: nextRoom, '!pular': nextRoom, $next: nextRoom,
+  $voltar: previousRoom, '!voltar': previousRoom, $previous: previousRoom,
+};
+
+const twitchDeniedAt = new Map();
+
+function canControlFromChat(tags, username) {
+  const badges = String(tags?.badges || '')
+    .split(',')
+    .map((badge) => badge.split('/')[0].trim().toLowerCase());
+  if (badges.includes('broadcaster') || badges.includes('moderator')) return true;
+  return TWITCH.admins.includes(String(username || '').toLowerCase());
+}
+
+function denyChatControl(username) {
+  const key = String(username || '').toLowerCase();
+  const now = Date.now();
+  if (now - (twitchDeniedAt.get(key) || 0) < 30000) return; // evita flood no chat
+  twitchDeniedAt.set(key, now);
+  replyTwitch(`@${key}: esse comando é só para moderadores do chat.`);
+}
+
 function handleTwitchLine(line) {
   line = line.trim();
   if (!line) return;
@@ -710,14 +756,40 @@ function handleTwitchLine(line) {
     return;
   }
 
-  const match = line.match(/^:([^!]+)!.*?PRIVMSG #([^ ]+) :(.*)$/);
+  const match = line.match(/^(?:@([^ ]+) )?:([^!]+)!.*?PRIVMSG #([^ ]+) :(.*)$/);
   if (!match) return;
 
-  const [, username, channel, message] = match;
+  const [, rawTags, username, channel, message] = match;
   if (channel !== TWITCH.channel) return;
+
+  const tags = {};
+  for (const part of String(rawTags || '').split(';')) {
+    if (!part) continue;
+    const eq = part.indexOf('=');
+    if (eq < 0) continue;
+    tags[part.slice(0, eq)] = part.slice(eq + 1);
+  }
 
   const [command, ...rest] = message.trim().split(/\s+/);
   const cmd = (command || '').toLowerCase();
+
+  // Moderadores (e o broadcaster) controlam o player sem precisar entrar na sala.
+  const control = CHAT_CONTROLS[cmd];
+  if (control) {
+    if (!canControlFromChat(tags, username)) {
+      denyChatControl(username);
+      return;
+    }
+    const room = getRoom(TWITCH.room);
+    if (!room) {
+      replyTwitch('A sala do DJ ainda não está aberta.');
+      return;
+    }
+    const result = control(room);
+    broadcastState(room);
+    replyTwitch(result.ok ? `${result.message} (por @${username})` : result.message);
+    return;
+  }
 
   // Consulta ao gosto musical da pessoa: $lista @usuario (ou só $lista para o ranking)
   if (cmd === '$lista' || cmd === '!lista' || cmd === '$list' || cmd === '!list') {
@@ -788,6 +860,7 @@ function connectTwitch() {
     console.log(`Twitch: conectando em #${TWITCH.channel} → sala ${TWITCH.room}`);
     twitchWs.send(`PASS oauth:${token}`);
     twitchWs.send(`NICK ${TWITCH.nick || TWITCH.channel}`);
+    twitchWs.send('CAP REQ :twitch.tv/tags'); // necessário para receber "badges" (moderador)
     twitchWs.send(`JOIN #${TWITCH.channel}`);
   });
 
