@@ -68,6 +68,8 @@ function createRoom(code = makeCode()) {
     updatedAt: Date.now(),
     queue: [],
     history: [],
+    // Ganho de volume por vídeo (0.4 a 1.3), compartilhado com todos os ouvintes.
+    gains: {},
     //Histórico de pedidos por usuário (chave = nome em minúsculas)
     userRequests: {},
     messages: [],
@@ -114,6 +116,7 @@ function stateFor(room, ws) {
     position: currentPosition(room),
     serverTime: Date.now(),
     queue: room.queue,
+    gains: room.gains || {},
     userRequests: Object.fromEntries(
       Object.entries(room.userRequests || {}).map(([user, tracks]) => [user, uniqueRequests(tracks)])
     ),
@@ -407,6 +410,12 @@ async function addTrack(room, input, requestedBy, ws) {
   return track;
 }
 
+function clampGain(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 1;
+  return Math.max(0.4, Math.min(1.3, Math.round(n * 100) / 100));
+}
+
 function playNext(room) {
   if (!room.queue.length) return false;
   if (room.current) room.history.push(room.current);
@@ -597,6 +606,41 @@ function handleAction(ws, room, msg) {
       const keys = Object.keys(room.userRequests);
       if (keys.length > 200) {
         for (const key of keys.slice(0, keys.length - 200)) delete room.userRequests[key];
+        changed = true;
+      }
+      if (changed) broadcastState(room);
+      break;
+    }
+
+    // Ganho de volume da faixa atual: o DJ ajusta uma vez e todos os ouvintes recebem.
+    case 'gain': {
+      if (!requireHost(room, ws)) return;
+      const videoId = String(msg.videoId || room.current?.videoId || '').slice(0, 32);
+      if (!videoId) return;
+      if (!room.gains) room.gains = {};
+      room.gains[videoId] = clampGain(msg.value);
+      broadcastState(room);
+      break;
+    }
+
+    // Após um restart do Render, o DJ devolve os ganhos salvos no navegador.
+    case 'restoreGains': {
+      if (!requireHost(room, ws)) return;
+      const incoming = msg.gains && typeof msg.gains === 'object' ? msg.gains : {};
+      if (!room.gains) room.gains = {};
+      let changed = false;
+      for (const [id, value] of Object.entries(incoming)) {
+        const videoId = String(id).slice(0, 32);
+        if (!videoId || !Number.isFinite(Number(value))) continue;
+        const gain = clampGain(value);
+        if (room.gains[videoId] !== gain) {
+          room.gains[videoId] = gain;
+          changed = true;
+        }
+      }
+      const ids = Object.keys(room.gains);
+      if (ids.length > 200) {
+        for (const id of ids.slice(0, ids.length - 200)) delete room.gains[id];
         changed = true;
       }
       if (changed) broadcastState(room);
